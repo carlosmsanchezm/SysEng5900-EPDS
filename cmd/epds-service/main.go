@@ -85,12 +85,10 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- 2. Extract and Validate Input ---
-	patientID := r.FormValue("patientId")
-	if strings.TrimSpace(patientID) == "" {
-		log.Printf("ERROR: Validation failed - patientId is missing")
-		sendJSONError(w, "Invalid input: patientId is required", http.StatusBadRequest)
-		return
-	}
+	patientID := strings.TrimSpace(r.FormValue("patientId"))
+	idSystem  := strings.TrimSpace(r.FormValue("patientIdentifierSystem"))
+	idValue   := strings.TrimSpace(r.FormValue("patientIdentifierValue"))
+	encID     := strings.TrimSpace(r.FormValue("encounterId"))
 
 	epdsScores := make([]int, 10)
 	for i := 1; i <= 10; i++ {
@@ -125,9 +123,10 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 		totalScore += score
 	}
 	q10Score := epdsScores[9]
-	log.Printf("Calculated EPDS score for Patient ID %s: Total Score = %d, Q10 Score = %d", patientID, totalScore, q10Score)
+	log.Printf("Calculated EPDS score (patient?: %s / %s|%s): Total=%d, Q10=%d", patientID, idSystem, idValue, totalScore, q10Score)
 
-	// --- 4. Authenticate with Oystehr ---
+	// --- 4. Resolve Patient (if needed) & Authenticate with Oystehr ---
+	// Defer resolution until after we have a token (same headers)
 	token, err := h.Authenticator.GetAuthToken()
 	if err != nil {
 		log.Printf("ERROR: Failed to get Oystehr token: %v", err)
@@ -135,10 +134,23 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Successfully obtained Oystehr token.")
+	// Resolve patient via identifier if patientId was not provided
+	fhirClient := &http.Client{} // shared per request
+	if patientID == "" {
+		if idSystem == "" || idValue == "" {
+			sendJSONError(w, "provide patientId OR patientIdentifierSystem+patientIdentifierValue", http.StatusBadRequest)
+			return
+		}
+		resolvedID, err := fhir.FindPatientIDByIdentifier(fhirClient, h.Config, token, idSystem, idValue)
+		if err != nil {
+			log.Printf("ERROR: patient lookup failed for %s|%s: %v", idSystem, idValue, err)
+			sendJSONError(w, "patient not found from identifier", http.StatusBadRequest)
+			return
+		}
+		patientID = resolvedID
+	}
 
 	// --- 5. Create FHIR Observation ---
-	// Use a single client for all subsequent FHIR calls in this request
-	fhirClient := &http.Client{}
 	observationId, err := fhir.CreateObservation(fhirClient, h.Config, token, patientID, totalScore)
 	if err != nil {
 		log.Printf("ERROR: Failed to create FHIR Observation: %v", err)
@@ -151,11 +163,16 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 	isHighRisk := totalScore >= 13 || q10Score >= 1
 	if isHighRisk {
 		log.Printf("High risk detected for Patient %s (Score: %d, Q10: %d). Attempting to create Flag and Communication.", patientID, totalScore, q10Score)
-
-		// Create Flag
-		// Hardcoded Encounter ID for demo purposes based on initial intake logs
-		encounterID := "25f26508-fee5-4811-9ab0-a95fecf40e5a"
-		flagId, flagErr := fhir.CreateFlag(fhirClient, h.Config, token, patientID, encounterID, totalScore, q10Score)
+		// Discover Encounter if not explicitly provided
+		if encID == "" {
+			if found, err := fhir.FindActiveEncounterID(fhirClient, h.Config, token, patientID); err != nil {
+				log.Printf("WARN: no active Encounter found for patient %s; creating Flag without encounter link (banner may not show). err=%v", patientID, err)
+			} else {
+				encID = found
+			}
+		}
+		// Create Flag (with Encounter link if we have it)
+		flagId, flagErr := fhir.CreateFlag(fhirClient, h.Config, token, patientID, encID, totalScore, q10Score)
 		if flagErr != nil {
 			// Log error but continue to attempt Communication creation
 			log.Printf("ERROR: Failed to create FHIR Flag: %v", flagErr)
