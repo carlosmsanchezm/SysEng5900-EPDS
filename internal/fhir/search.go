@@ -40,10 +40,35 @@ func FindPatientIDByIdentifier(httpClient *http.Client, cfg *config.Config, toke
     return p.ID, nil
 }
 
-// GET /Encounter?subject=Patient/{id}&status=arrived,in-progress&_sort=-date&_count=1
+// GET /Encounter?appointment=Appointment/{id}&_sort=-date&_count=1
+func FindEncounterByAppointment(httpClient *http.Client, cfg *config.Config, token, appointmentID string) (string, error) {
+    if httpClient == nil { httpClient = &http.Client{Timeout: 10 * time.Second} }
+    u := fmt.Sprintf("%s/Encounter?appointment=Appointment/%s&_sort=-date&_count=1",
+        cfg.OystehrFHIRBaseURL, appointmentID)
+    req, _ := http.NewRequest(http.MethodGet, u, nil)
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+    req.Header.Set("Accept", "application/fhir+json")
+
+    resp, err := httpClient.Do(req)
+    if err != nil { return "", fmt.Errorf("encounter search by appointment failed: %w", err) }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("encounter search by appointment status %d", resp.StatusCode) }
+
+    var b bundle
+    if err := json.NewDecoder(resp.Body).Decode(&b); err != nil { return "", fmt.Errorf("encounter bundle decode: %w", err) }
+    if len(b.Entry) == 0 { return "", fmt.Errorf("no encounter found for appointment %s", appointmentID) }
+
+    var e fhirID
+    if err := json.Unmarshal(b.Entry[0].Resource, &e); err != nil { return "", fmt.Errorf("encounter id parse: %w", err) }
+    if e.ID == "" { return "", fmt.Errorf("encounter id missing") }
+    return e.ID, nil
+}
+
+// GET /Encounter?subject=Patient/{id}&status=planned,arrived,in-progress&_sort=-date&_count=1
 func FindActiveEncounterID(httpClient *http.Client, cfg *config.Config, token, patientID string) (string, error) {
     if httpClient == nil { httpClient = &http.Client{Timeout: 10 * time.Second} }
-    u := fmt.Sprintf("%s/Encounter?subject=Patient/%s&status=arrived,in-progress&_sort=-date&_count=1",
+    u := fmt.Sprintf("%s/Encounter?subject=Patient/%s&status=planned,arrived,in-progress&_sort=-date&_count=1",
         cfg.OystehrFHIRBaseURL, patientID)
     req, _ := http.NewRequest(http.MethodGet, u, nil)
     req.Header.Set("Authorization", "Bearer "+token)

@@ -48,9 +48,9 @@ func CreateFlag(httpClient *http.Client, cfg *config.Config, token string, patie
 		Status:       "active",
 		Category: []fhirCategory{{
 			Coding: []fhirCoding{{
-				System:  "http://example.org/codes", // Using example from PRD
-				Code:    "epds-high-risk",
-				Display: "EPDS High Risk Alert",
+				System:  "http://terminology.hl7.org/CodeSystem/flag-category",
+				Code:    "safety",
+				Display: "Safety",
 			}},
 			Text: "High EPDS Score or Self-Harm Risk Reported", // Adding text as per example
 		}},

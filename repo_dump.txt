@@ -1,3 +1,163 @@
+===== FILE: ./.claude/settings.local.json =====
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(go build:*)",
+      "Bash(chmod:*)",
+      "Bash(curl:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
+
+===== FILE: ./arrive_visit.sh =====
+#!/bin/bash
+
+# Script to arrive a visit by creating/updating FHIR Encounter
+# Based on Oystehr FHIR API documentation
+
+set -e  # Exit on any error
+
+# Configuration
+TOKEN="${TOKEN:-}"
+PROJECT_ID="596a23c5-e239-412b-bb05-55e47f41e1f8"
+FHIR_BASE="https://fhir-api.zapehr.com/r4"
+
+# From your created patient/appointment
+APPT_ID="${APPT_ID:-bdec0198-05c5-4ff4-9b46-451b16c2fed7}"
+PATIENT_ID="${PATIENT_ID:-9ba19f41-6f9c-4f6a-9201-5c489da98fe2}"
+
+# Check required parameters
+if [ -z "$TOKEN" ]; then
+    echo "ERROR: TOKEN environment variable required"
+    echo "Usage: TOKEN='your-token' ./arrive_visit.sh"
+    exit 1
+fi
+
+echo "=== Arriving Visit ==="
+echo "Appointment ID: $APPT_ID"
+echo "Patient ID: $PATIENT_ID"
+echo "Project ID: $PROJECT_ID"
+echo ""
+
+# Common headers
+H_AUTH="Authorization: Bearer $TOKEN"
+H_PROJECT="x-zapehr-project-id: $PROJECT_ID"
+H_ACCEPT="Accept: application/fhir+json"
+H_CONTENT="Content-Type: application/fhir+json"
+
+echo "Step 1: Verify Appointment exists..."
+APPT_RESPONSE=$(curl -sS \
+  -H "$H_AUTH" \
+  -H "$H_PROJECT" \
+  -H "$H_ACCEPT" \
+  "$FHIR_BASE/Appointment/$APPT_ID" || echo "ERROR")
+
+if [[ "$APPT_RESPONSE" == *"ERROR"* ]] || [[ "$APPT_RESPONSE" == *"Not Found"* ]]; then
+    echo "ERROR: Could not find Appointment $APPT_ID"
+    echo "Response: $APPT_RESPONSE"
+    exit 1
+fi
+
+echo "✓ Appointment found"
+echo ""
+
+echo "Step 2: Check for existing Encounter..."
+ENC_SEARCH=$(curl -sS \
+  -H "$H_AUTH" \
+  -H "$H_PROJECT" \
+  -H "$H_ACCEPT" \
+  "$FHIR_BASE/Encounter?appointment=Appointment/$APPT_ID&_sort=-date&_count=1")
+
+# Check if we found any encounters
+ENC_COUNT=$(echo "$ENC_SEARCH" | jq -r '.total // 0')
+echo "Found $ENC_COUNT existing encounters for this appointment"
+
+if [ "$ENC_COUNT" -gt 0 ]; then
+    # Update existing encounter
+    ENC_ID=$(echo "$ENC_SEARCH" | jq -r '.entry[0].resource.id')
+    CURRENT_STATUS=$(echo "$ENC_SEARCH" | jq -r '.entry[0].resource.status')
+    
+    echo "Found existing Encounter: $ENC_ID (status: $CURRENT_STATUS)"
+    
+    if [ "$CURRENT_STATUS" = "arrived" ] || [ "$CURRENT_STATUS" = "in-progress" ]; then
+        echo "✓ Encounter already in active status: $CURRENT_STATUS"
+        echo "Encounter ID: $ENC_ID"
+    else
+        echo "Updating encounter status to 'arrived'..."
+        PATCH_RESPONSE=$(curl -sS -X PATCH \
+          -H "$H_AUTH" \
+          -H "$H_PROJECT" \
+          -H "Content-Type: application/json-patch+json" \
+          "$FHIR_BASE/Encounter/$ENC_ID" \
+          --data '[{"op":"replace","path":"/status","value":"arrived"}]')
+        
+        NEW_STATUS=$(echo "$PATCH_RESPONSE" | jq -r '.status')
+        echo "✓ Updated encounter status to: $NEW_STATUS"
+        echo "Encounter ID: $ENC_ID"
+    fi
+else
+    # Create new encounter
+    echo "No existing encounter found. Creating new one..."
+    
+    NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    CREATE_RESPONSE=$(curl -sS -X POST \
+      -H "$H_AUTH" \
+      -H "$H_PROJECT" \
+      -H "$H_CONTENT" \
+      "$FHIR_BASE/Encounter" \
+      --data @- <<EOF
+{
+  "resourceType": "Encounter",
+  "status": "arrived",
+  "class": { 
+    "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", 
+    "code": "AMB", 
+    "display": "ambulatory" 
+  },
+  "subject": { "reference": "Patient/$PATIENT_ID" },
+  "appointment": [ { "reference": "Appointment/$APPT_ID" } ],
+  "period": { "start": "$NOW" }
+}
+EOF
+)
+    
+    ENC_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+    NEW_STATUS=$(echo "$CREATE_RESPONSE" | jq -r '.status')
+    
+    if [ "$ENC_ID" = "null" ] || [ -z "$ENC_ID" ]; then
+        echo "ERROR: Failed to create encounter"
+        echo "Response: $CREATE_RESPONSE"
+        exit 1
+    fi
+    
+    echo "✓ Created new encounter: $ENC_ID (status: $NEW_STATUS)"
+fi
+
+echo ""
+echo "=== Visit Arrived Successfully ==="
+echo "Encounter ID: $ENC_ID"
+echo "Patient ID: $PATIENT_ID"
+echo ""
+echo "You can now test EPDS submission with:"
+echo "curl -X POST http://localhost:8080/api/v1/submit-epds \\"
+echo "  -d \"patientId=$PATIENT_ID\" \\"
+echo "  -d \"q1=3&q2=2&q3=1&q4=2&q5=1&q6=3&q7=1&q8=0&q9=0&q10=1\""
+echo ""
+echo "Or with explicit encounter ID:"
+echo "curl -X POST http://localhost:8080/api/v1/submit-epds \\"
+echo "  -d \"patientId=$PATIENT_ID\" \\"
+echo "  -d \"encounterId=$ENC_ID\" \\"
+echo "  -d \"q1=3&q2=2&q3=1&q4=2&q5=1&q6=3&q7=1&q8=0&q9=0&q10=1\""
+
 ===== FILE: ./cmd/epds-service/main.go =====
 package main
 
@@ -86,12 +246,11 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- 2. Extract and Validate Input ---
-	patientID := r.FormValue("patientId")
-	if strings.TrimSpace(patientID) == "" {
-		log.Printf("ERROR: Validation failed - patientId is missing")
-		sendJSONError(w, "Invalid input: patientId is required", http.StatusBadRequest)
-		return
-	}
+	patientID := strings.TrimSpace(r.FormValue("patientId"))
+	idSystem  := strings.TrimSpace(r.FormValue("patientIdentifierSystem"))
+	idValue   := strings.TrimSpace(r.FormValue("patientIdentifierValue"))
+	encID     := strings.TrimSpace(r.FormValue("encounterId"))
+	apptID    := strings.TrimSpace(r.FormValue("appointmentId"))
 
 	epdsScores := make([]int, 10)
 	for i := 1; i <= 10; i++ {
@@ -126,9 +285,10 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 		totalScore += score
 	}
 	q10Score := epdsScores[9]
-	log.Printf("Calculated EPDS score for Patient ID %s: Total Score = %d, Q10 Score = %d", patientID, totalScore, q10Score)
+	log.Printf("Calculated EPDS score (patient?: %s / %s|%s): Total=%d, Q10=%d", patientID, idSystem, idValue, totalScore, q10Score)
 
-	// --- 4. Authenticate with Oystehr ---
+	// --- 4. Resolve Patient (if needed) & Authenticate with Oystehr ---
+	// Defer resolution until after we have a token (same headers)
 	token, err := h.Authenticator.GetAuthToken()
 	if err != nil {
 		log.Printf("ERROR: Failed to get Oystehr token: %v", err)
@@ -136,10 +296,23 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Successfully obtained Oystehr token.")
+	// Resolve patient via identifier if patientId was not provided
+	fhirClient := &http.Client{} // shared per request
+	if patientID == "" {
+		if idSystem == "" || idValue == "" {
+			sendJSONError(w, "provide patientId OR patientIdentifierSystem+patientIdentifierValue", http.StatusBadRequest)
+			return
+		}
+		resolvedID, err := fhir.FindPatientIDByIdentifier(fhirClient, h.Config, token, idSystem, idValue)
+		if err != nil {
+			log.Printf("ERROR: patient lookup failed for %s|%s: %v", idSystem, idValue, err)
+			sendJSONError(w, "patient not found from identifier", http.StatusBadRequest)
+			return
+		}
+		patientID = resolvedID
+	}
 
 	// --- 5. Create FHIR Observation ---
-	// Use a single client for all subsequent FHIR calls in this request
-	fhirClient := &http.Client{}
 	observationId, err := fhir.CreateObservation(fhirClient, h.Config, token, patientID, totalScore)
 	if err != nil {
 		log.Printf("ERROR: Failed to create FHIR Observation: %v", err)
@@ -152,11 +325,31 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 	isHighRisk := totalScore >= 13 || q10Score >= 1
 	if isHighRisk {
 		log.Printf("High risk detected for Patient %s (Score: %d, Q10: %d). Attempting to create Flag and Communication.", patientID, totalScore, q10Score)
-
-		// Create Flag
-		// Hardcoded Encounter ID for demo purposes based on initial intake logs
-		encounterID := "25f26508-fee5-4811-9ab0-a95fecf40e5a"
-		flagId, flagErr := fhir.CreateFlag(fhirClient, h.Config, token, patientID, encounterID, totalScore, q10Score)
+		
+		// Cascading encounter discovery
+		if encID == "" {
+			// Try appointment-based discovery first (if appointmentId provided)
+			if apptID != "" {
+				if found, err := fhir.FindEncounterByAppointment(fhirClient, h.Config, token, apptID); err == nil {
+					encID = found
+					log.Printf("Found encounter %s via appointment %s", encID, apptID)
+				} else {
+					log.Printf("WARN: appointment→encounter lookup failed for %s: %v", apptID, err)
+				}
+			}
+			// Fall back to patient-based discovery
+			if encID == "" {
+				if found, err := fhir.FindActiveEncounterID(fhirClient, h.Config, token, patientID); err == nil {
+					encID = found
+					log.Printf("Found encounter %s via patient search", encID)
+				} else {
+					log.Printf("WARN: no active Encounter found for patient %s; creating patient-scoped Flag only (banner may not show). err=%v", patientID, err)
+				}
+			}
+		}
+		
+		// Create Flag (with Encounter link if we have it, patient-scoped if not)
+		flagId, flagErr := fhir.CreateFlag(fhirClient, h.Config, token, patientID, encID, totalScore, q10Score)
 		if flagErr != nil {
 			// Log error but continue to attempt Communication creation
 			log.Printf("ERROR: Failed to create FHIR Flag: %v", flagErr)
@@ -822,4 +1015,158 @@ func CreateObservation(httpClient *http.Client, cfg *config.Config, token string
 	return createdObs.ID, nil
 }
 
+
+===== FILE: ./internal/fhir/search.go =====
+package fhir
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "time"
+
+    "example.com/epds-service/internal/config"
+)
+
+type bundle struct {
+    Entry []struct {
+        Resource json.RawMessage `json:"resource"`
+    } `json:"entry"`
+}
+type fhirID struct{ ID string `json:"id"` }
+
+// GET /Patient?identifier={system}|{value}
+func FindPatientIDByIdentifier(httpClient *http.Client, cfg *config.Config, token, system, value string) (string, error) {
+    if httpClient == nil { httpClient = &http.Client{Timeout: 10 * time.Second} }
+    u := fmt.Sprintf("%s/Patient?identifier=%s|%s", cfg.OystehrFHIRBaseURL, system, value)
+    req, _ := http.NewRequest(http.MethodGet, u, nil)
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+    req.Header.Set("Accept", "application/fhir+json")
+
+    resp, err := httpClient.Do(req)
+    if err != nil { return "", fmt.Errorf("patient search failed: %w", err) }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("patient search status %d", resp.StatusCode) }
+
+    var b bundle
+    if err := json.NewDecoder(resp.Body).Decode(&b); err != nil { return "", fmt.Errorf("patient bundle decode: %w", err) }
+    if len(b.Entry) == 0 { return "", fmt.Errorf("patient not found for %s|%s", system, value) }
+
+    var p fhirID
+    if err := json.Unmarshal(b.Entry[0].Resource, &p); err != nil { return "", fmt.Errorf("patient id parse: %w", err) }
+    if p.ID == "" { return "", fmt.Errorf("patient id missing") }
+    return p.ID, nil
+}
+
+// GET /Encounter?appointment=Appointment/{id}&_sort=-date&_count=1
+func FindEncounterByAppointment(httpClient *http.Client, cfg *config.Config, token, appointmentID string) (string, error) {
+    if httpClient == nil { httpClient = &http.Client{Timeout: 10 * time.Second} }
+    u := fmt.Sprintf("%s/Encounter?appointment=Appointment/%s&_sort=-date&_count=1",
+        cfg.OystehrFHIRBaseURL, appointmentID)
+    req, _ := http.NewRequest(http.MethodGet, u, nil)
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+    req.Header.Set("Accept", "application/fhir+json")
+
+    resp, err := httpClient.Do(req)
+    if err != nil { return "", fmt.Errorf("encounter search by appointment failed: %w", err) }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("encounter search by appointment status %d", resp.StatusCode) }
+
+    var b bundle
+    if err := json.NewDecoder(resp.Body).Decode(&b); err != nil { return "", fmt.Errorf("encounter bundle decode: %w", err) }
+    if len(b.Entry) == 0 { return "", fmt.Errorf("no encounter found for appointment %s", appointmentID) }
+
+    var e fhirID
+    if err := json.Unmarshal(b.Entry[0].Resource, &e); err != nil { return "", fmt.Errorf("encounter id parse: %w", err) }
+    if e.ID == "" { return "", fmt.Errorf("encounter id missing") }
+    return e.ID, nil
+}
+
+// GET /Encounter?subject=Patient/{id}&status=planned,arrived,in-progress&_sort=-date&_count=1
+func FindActiveEncounterID(httpClient *http.Client, cfg *config.Config, token, patientID string) (string, error) {
+    if httpClient == nil { httpClient = &http.Client{Timeout: 10 * time.Second} }
+    u := fmt.Sprintf("%s/Encounter?subject=Patient/%s&status=planned,arrived,in-progress&_sort=-date&_count=1",
+        cfg.OystehrFHIRBaseURL, patientID)
+    req, _ := http.NewRequest(http.MethodGet, u, nil)
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+    req.Header.Set("Accept", "application/fhir+json")
+
+    resp, err := httpClient.Do(req)
+    if err != nil { return "", fmt.Errorf("encounter search failed: %w", err) }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("encounter search status %d", resp.StatusCode) }
+
+    var b bundle
+    if err := json.NewDecoder(resp.Body).Decode(&b); err != nil { return "", fmt.Errorf("encounter bundle decode: %w", err) }
+    if len(b.Entry) == 0 { return "", fmt.Errorf("no active encounter found for patient %s", patientID) }
+
+    var e fhirID
+    if err := json.Unmarshal(b.Entry[0].Resource, &e); err != nil { return "", fmt.Errorf("encounter id parse: %w", err) }
+    if e.ID == "" { return "", fmt.Errorf("encounter id missing") }
+    return e.ID, nil
+}
+
+===== FILE: ./test_epds.sh =====
+#!/bin/bash
+
+# Test script for EPDS service
+# Usage: ./test_epds.sh
+
+BASE_URL="http://localhost:8080"
+ENDPOINT="/api/v1/submit-epds"
+
+echo "EPDS Service Test Script"
+echo "========================"
+echo "Make sure the service is running on $BASE_URL"
+echo ""
+
+# Test A: With patientId only (Encounter discovery auto)
+echo "Test A: With patientId only (auto encounter discovery)"
+echo "Replace <PATIENT_UUID> with actual patient ID:"
+echo "curl -X POST $BASE_URL$ENDPOINT \\"
+echo "  -d \"patientId=<PATIENT_UUID>\" \\"
+echo "  -d \"q1=3&q2=2&q3=1&q4=2&q5=1&q6=3&q7=1&q8=0&q9=0&q10=1\""
+echo ""
+
+# Test B: With identifier (no patientId)
+echo "Test B: With patient identifier (no patientId)"
+echo "Replace system and value with actual identifier:"
+echo "curl -X POST $BASE_URL$ENDPOINT \\"
+echo "  -d \"patientIdentifierSystem=http://hospital.example/mrn\" \\"
+echo "  -d \"patientIdentifierValue=MRN-12345\" \\"
+echo "  -d \"q1=3&q2=2&q3=1&q4=2&q5=1&q6=3&q7=1&q8=0&q9=0&q10=1\""
+echo ""
+
+# Test C: Explicit Encounter (bypass discovery)
+echo "Test C: With explicit encounter ID"
+echo "Replace UUIDs with actual values:"
+echo "curl -X POST $BASE_URL$ENDPOINT \\"
+echo "  -d \"patientId=<PATIENT_UUID>\" \\"
+echo "  -d \"encounterId=<ENCOUNTER_UUID>\" \\"
+echo "  -d \"q1=4&q2=3&q3=2&q4=3&q5=1&q6=3&q7=1&q8=0&q9=0&q10=0\""
+echo ""
+
+# Test D: Low-risk (no Flag)
+echo "Test D: Low-risk score (no Flag created)"
+echo "Replace <PATIENT_UUID> with actual patient ID:"
+echo "curl -X POST $BASE_URL$ENDPOINT \\"
+echo "  -d \"patientId=<PATIENT_UUID>\" \\"
+echo "  -d \"q1=0&q2=0&q3=0&q4=1&q5=0&q6=1&q7=0&q8=0&q9=0&q10=0\""
+echo ""
+
+# Test E: Missing required fields
+echo "Test E: Missing required fields (should return error)"
+echo "curl -X POST $BASE_URL$ENDPOINT \\"
+echo "  -d \"q1=1&q2=1&q3=1&q4=1&q5=1&q6=1&q7=1&q8=1&q9=1&q10=1\""
+echo ""
+
+echo "Expected behaviors:"
+echo "- Test A: Should find active encounter automatically"
+echo "- Test B: Should resolve patient ID from identifier"
+echo "- Test C: Should use explicit encounter ID"  
+echo "- Test D: Should create Observation but no Flag (low risk)"
+echo "- Test E: Should return error about missing patient info"
 

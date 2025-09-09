@@ -89,6 +89,7 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 	idSystem  := strings.TrimSpace(r.FormValue("patientIdentifierSystem"))
 	idValue   := strings.TrimSpace(r.FormValue("patientIdentifierValue"))
 	encID     := strings.TrimSpace(r.FormValue("encounterId"))
+	apptID    := strings.TrimSpace(r.FormValue("appointmentId"))
 
 	epdsScores := make([]int, 10)
 	for i := 1; i <= 10; i++ {
@@ -163,15 +164,30 @@ func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
 	isHighRisk := totalScore >= 13 || q10Score >= 1
 	if isHighRisk {
 		log.Printf("High risk detected for Patient %s (Score: %d, Q10: %d). Attempting to create Flag and Communication.", patientID, totalScore, q10Score)
-		// Discover Encounter if not explicitly provided
+		
+		// Cascading encounter discovery
 		if encID == "" {
-			if found, err := fhir.FindActiveEncounterID(fhirClient, h.Config, token, patientID); err != nil {
-				log.Printf("WARN: no active Encounter found for patient %s; creating Flag without encounter link (banner may not show). err=%v", patientID, err)
-			} else {
-				encID = found
+			// Try appointment-based discovery first (if appointmentId provided)
+			if apptID != "" {
+				if found, err := fhir.FindEncounterByAppointment(fhirClient, h.Config, token, apptID); err == nil {
+					encID = found
+					log.Printf("Found encounter %s via appointment %s", encID, apptID)
+				} else {
+					log.Printf("WARN: appointment→encounter lookup failed for %s: %v", apptID, err)
+				}
+			}
+			// Fall back to patient-based discovery
+			if encID == "" {
+				if found, err := fhir.FindActiveEncounterID(fhirClient, h.Config, token, patientID); err == nil {
+					encID = found
+					log.Printf("Found encounter %s via patient search", encID)
+				} else {
+					log.Printf("WARN: no active Encounter found for patient %s; creating patient-scoped Flag only (banner may not show). err=%v", patientID, err)
+				}
 			}
 		}
-		// Create Flag (with Encounter link if we have it)
+		
+		// Create Flag (with Encounter link if we have it, patient-scoped if not)
 		flagId, flagErr := fhir.CreateFlag(fhirClient, h.Config, token, patientID, encID, totalScore, q10Score)
 		if flagErr != nil {
 			// Log error but continue to attempt Communication creation
