@@ -1,0 +1,825 @@
+===== FILE: ./cmd/epds-service/main.go =====
+package main
+
+import (
+	"encoding/json" // Import for JSON error responses
+	"fmt"
+	"log"
+	"net/http"
+	"strconv" // Import for string conversion
+	"strings" // Import for string manipulation (optional, could be useful)
+
+	"example.com/epds-service/internal/auth"   // Import the auth package
+	"example.com/epds-service/internal/config" // Import the config package
+	"example.com/epds-service/internal/fhir"   // Import the fhir package
+)
+
+// ApiHandler holds dependencies for the API handlers.
+type ApiHandler struct {
+	Config        *config.Config
+	Authenticator *auth.Authenticator
+	// TODO: Consider adding a shared HTTP client here if needed for multiple FHIR calls
+}
+
+// ErrorResponse defines the structure for JSON error responses.
+type ErrorResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+// Helper function to send JSON errors
+func sendJSONError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(ErrorResponse{Status: "error", Message: message})
+}
+
+func main() {
+	// Load application configuration
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Create Oystehr authenticator
+	authenticator := auth.NewAuthenticator(cfg, nil) // Using default HTTP client for now
+
+	// Create the API handler with dependencies
+	apiHandler := &ApiHandler{
+		Config:        cfg,
+		Authenticator: authenticator,
+	}
+
+	// Setup HTTP routes
+	http.HandleFunc("/api/v1/submit-epds", apiHandler.handleSubmitEPDS)
+
+	// Use port from loaded config
+	addr := fmt.Sprintf(":%s", cfg.Port)
+	log.Printf("Starting EPDS service on %s", addr)
+
+	// Start the HTTP server
+	err = http.ListenAndServe(addr, nil)
+	if err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+// handleSubmitEPDS parses, validates, scores, authenticates, creates Observation,
+// and creates Flag/Communication for high-risk results.
+func (h *ApiHandler) handleSubmitEPDS(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received request for %s from %s", r.URL.Path, r.RemoteAddr)
+
+	// Basic validation: Ensure it's a POST request
+	if r.Method != http.MethodPost {
+		// Note: http.Error sets Content-Type to text/plain, override if JSON is strictly needed
+		// sendJSONError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		log.Printf("Rejected non-POST request for %s", r.URL.Path)
+		return
+	}
+
+	// --- 1. Parse request body (assuming application/x-www-form-urlencoded) ---
+	if err := r.ParseForm(); err != nil {
+		log.Printf("ERROR: Failed to parse form data: %v", err)
+		sendJSONError(w, "Failed to parse request body", http.StatusBadRequest)
+		return
+	}
+
+	// --- 2. Extract and Validate Input ---
+	patientID := r.FormValue("patientId")
+	if strings.TrimSpace(patientID) == "" {
+		log.Printf("ERROR: Validation failed - patientId is missing")
+		sendJSONError(w, "Invalid input: patientId is required", http.StatusBadRequest)
+		return
+	}
+
+	epdsScores := make([]int, 10)
+	for i := 1; i <= 10; i++ {
+		qKey := fmt.Sprintf("q%d", i)
+		qValueStr := r.FormValue(qKey)
+		if qValueStr == "" {
+			log.Printf("ERROR: Validation failed - %s is missing", qKey)
+			sendJSONError(w, fmt.Sprintf("Invalid input: %s is required", qKey), http.StatusBadRequest)
+			return
+		}
+
+		qValueInt, err := strconv.Atoi(qValueStr)
+		if err != nil {
+			log.Printf("ERROR: Validation failed - %s is not a valid integer ('%s'): %v", qKey, qValueStr, err)
+			sendJSONError(w, fmt.Sprintf("Invalid input: %s must be an integer", qKey), http.StatusBadRequest)
+			return
+		}
+
+		if qValueInt < 0 || qValueInt > 3 {
+			log.Printf("ERROR: Validation failed - %s score (%d) out of range [0, 3]", qKey, qValueInt)
+			sendJSONError(w, fmt.Sprintf("Invalid input: %s score must be between 0 and 3", qKey), http.StatusBadRequest)
+			return
+		}
+		epdsScores[i-1] = qValueInt // Store score (adjusting for 0-based index)
+	}
+
+	log.Printf("Successfully parsed and validated input for Patient ID: %s, Scores: %v", patientID, epdsScores)
+
+	// --- 3. Calculate EPDS Score ---
+	totalScore := 0
+	for _, score := range epdsScores {
+		totalScore += score
+	}
+	q10Score := epdsScores[9]
+	log.Printf("Calculated EPDS score for Patient ID %s: Total Score = %d, Q10 Score = %d", patientID, totalScore, q10Score)
+
+	// --- 4. Authenticate with Oystehr ---
+	token, err := h.Authenticator.GetAuthToken()
+	if err != nil {
+		log.Printf("ERROR: Failed to get Oystehr token: %v", err)
+		sendJSONError(w, "Internal server error - authentication failed", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Successfully obtained Oystehr token.")
+
+	// --- 5. Create FHIR Observation ---
+	// Use a single client for all subsequent FHIR calls in this request
+	fhirClient := &http.Client{}
+	observationId, err := fhir.CreateObservation(fhirClient, h.Config, token, patientID, totalScore)
+	if err != nil {
+		log.Printf("ERROR: Failed to create FHIR Observation: %v", err)
+		sendJSONError(w, "Failed to create FHIR Observation", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Successfully created Observation ID: %s", observationId)
+
+	// --- 6. Create FHIR Flag & Communication if High Risk ---
+	isHighRisk := totalScore >= 13 || q10Score >= 1
+	if isHighRisk {
+		log.Printf("High risk detected for Patient %s (Score: %d, Q10: %d). Attempting to create Flag and Communication.", patientID, totalScore, q10Score)
+
+		// Create Flag
+		// Hardcoded Encounter ID for demo purposes based on initial intake logs
+		encounterID := "25f26508-fee5-4811-9ab0-a95fecf40e5a"
+		flagId, flagErr := fhir.CreateFlag(fhirClient, h.Config, token, patientID, encounterID, totalScore, q10Score)
+		if flagErr != nil {
+			// Log error but continue to attempt Communication creation
+			log.Printf("ERROR: Failed to create FHIR Flag: %v", flagErr)
+		} else {
+			log.Printf("Successfully created Flag ID: %s", flagId)
+		}
+
+		// Create Communication
+		commId, commErr := fhir.CreateCommunication(fhirClient, h.Config, token, patientID, h.Config.AlertProviderFHIRID, totalScore, q10Score)
+		if commErr != nil {
+			// Log error, but response to client is already determined by Observation success
+			log.Printf("ERROR: Failed to create FHIR Communication: %v", commErr)
+		} else {
+			log.Printf("Successfully created Communication ID: %s", commId)
+		}
+	}
+
+	// --- 7. Return Success Response ---
+	// The primary outcome (Observation creation) was successful.
+	// Errors in Flag/Communication creation are logged but don't cause a client-facing error.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status": "success", "observationId": "%s", "calculatedScore": %d}`, observationId, totalScore)
+	log.Printf("Successfully processed EPDS submission for Patient %s. Observation ID: %s", patientID, observationId)
+}
+
+
+===== FILE: ./env.sh =====
+# --- Oystehr API Endpoints ---
+# (These usually don't change, but confirm from your console if needed)
+export OYSTEHR_FHIR_BASE_URL="https://fhir-api.zapehr.com/r4"
+export OYSTEHR_AUTH_URL="https://auth.zapehr.com/oauth/token"
+
+# --- Your Project and M2M Client Details ---
+export OYSTEHR_PROJECT_ID="596a23c5-e239-412b-bb05-55e47f41e1f8"
+export OYSTEHR_M2M_CLIENT_ID="QfHq018YKWQDhWlbL9mW9jsT7JakDP5n"
+
+# --- IMPORTANT: Paste your NEW Secret Here ---
+# Replace YOUR_NEW_M2M_CLIENT_SECRET below with the actual secret you copied
+export OYSTEHR_M2M_CLIENT_SECRET="ufqGWeG1DKreVaYs7yydt2DJhnL3sHKgGauvTIcbiWZfQukDNKBvS_Wz8jzD2GMW"
+
+# --- Target Provider for Alerts ---
+# Using "Example Doctor" ID you provided
+export ALERT_PROVIDER_FHIR_ID="Practitioner/f5d7cbdf-f829-4e0e-846b-63ce53ca8c6c"
+
+# --- Optional Port ---
+# (Uncomment the line below only if you need a port other than 8080)
+# export PORT="8080"
+
+===== FILE: ./go.mod =====
+module example.com/epds-service
+
+go 1.24.2
+
+
+===== FILE: ./internal/auth/auth.go =====
+package auth
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"example.com/epds-service/internal/config" // Assuming this is your module path
+)
+
+// AuthResponse represents the successful JSON response from the Oystehr auth endpoint.
+type AuthResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int64  `json:"expires_in"` // Oystehr returns expires_in in seconds
+}
+
+// AuthErrorResponse represents a potential error JSON response from Oystehr auth.
+type AuthErrorResponse struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
+// Authenticator handles fetching and caching of Oystehr M2M tokens.
+type Authenticator struct {
+	config      *config.Config
+	httpClient  *http.Client
+	token       string
+	expiry      time.Time
+	mutex       sync.RWMutex
+	tokenBuffer time.Duration // Buffer before actual expiry to refresh token
+}
+
+// NewAuthenticator creates a new Authenticator instance.
+func NewAuthenticator(cfg *config.Config, client *http.Client) *Authenticator {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second} // Default client with timeout
+	}
+	return &Authenticator{
+		config:      cfg,
+		httpClient:  client,
+		tokenBuffer: 5 * time.Minute, // Refresh token 5 minutes before it expires
+	}
+}
+
+// GetAuthToken retrieves a valid Oystehr access token, fetching a new one if necessary.
+func (a *Authenticator) GetAuthToken() (string, error) {
+	a.mutex.RLock()
+	// Check if the current token is valid and not nearing expiry
+	if a.token != "" && time.Now().Before(a.expiry.Add(-a.tokenBuffer)) {
+		token := a.token
+		a.mutex.RUnlock()
+		log.Println("Using cached Oystehr token")
+		return token, nil
+	}
+	a.mutex.RUnlock()
+
+	// If token is invalid or nearing expiry, acquire write lock and fetch new token
+	return a.fetchNewToken()
+}
+
+// fetchNewToken performs the POST request to get a new token.
+func (a *Authenticator) fetchNewToken() (string, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	// Double-check if another goroutine fetched the token while waiting for the lock
+	if a.token != "" && time.Now().Before(a.expiry.Add(-a.tokenBuffer)) {
+		log.Println("Another routine refreshed the token while waiting for lock")
+		return a.token, nil
+	}
+
+	log.Println("Fetching new Oystehr token...")
+
+	// Prepare request body according to Appendix A.4
+	reqBodyMap := map[string]string{
+		"client_id":     a.config.OystehrM2MClientID,
+		"client_secret": a.config.OystehrM2MClientSecret,
+		"grant_type":    "client_credentials",
+		"audience":      "https://api.zapehr.com", // As specified in Appendix A.4
+	}
+	reqBodyBytes, err := json.Marshal(reqBodyMap)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal auth request body: %w", err)
+	}
+
+	// Create POST request
+	req, err := http.NewRequest("POST", a.config.OystehrAuthURL, bytes.NewBuffer(reqBodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create auth request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	// Execute request
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute auth request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read auth response body: %w", err)
+	}
+
+	// Handle non-200 status codes
+	if resp.StatusCode != http.StatusOK {
+		var errResp AuthErrorResponse
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			// Try to parse Oystehr error format
+			return "", fmt.Errorf("oystehr auth API error (%d): %s - %s", resp.StatusCode, errResp.Error, errResp.ErrorDescription)
+		}
+		// Fallback error message
+		return "", fmt.Errorf("oystehr auth API request failed with status code %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// Parse successful response
+	var authResp AuthResponse
+	if err := json.Unmarshal(bodyBytes, &authResp); err != nil {
+		return "", fmt.Errorf("failed to unmarshal auth response JSON: %w", err)
+	}
+
+	if authResp.AccessToken == "" {
+		return "", fmt.Errorf("received empty access token from Oystehr auth API")
+	}
+
+	// Store the new token and expiry time
+	a.token = authResp.AccessToken
+	a.expiry = time.Now().Add(time.Duration(authResp.ExpiresIn) * time.Second)
+	log.Printf("Successfully fetched new Oystehr token. Expires in: %d seconds", authResp.ExpiresIn)
+
+	return a.token, nil
+}
+
+
+===== FILE: ./internal/config/config.go =====
+package config
+
+import (
+	"fmt"
+	"os"
+)
+
+// Config holds the application configuration loaded from environment variables.
+type Config struct {
+	OystehrFHIRBaseURL     string
+	OystehrAuthURL         string
+	OystehrProjectID       string
+	OystehrM2MClientID     string
+	OystehrM2MClientSecret string
+	AlertProviderFHIRID    string
+	Port                   string // Optional port from environment
+}
+
+// LoadConfig reads required environment variables and returns a Config struct.
+// It returns an error if any required variable is missing.
+func LoadConfig() (*Config, error) {
+	cfg := &Config{
+		OystehrFHIRBaseURL:     os.Getenv("OYSTEHR_FHIR_BASE_URL"),
+		OystehrAuthURL:         os.Getenv("OYSTEHR_AUTH_URL"),
+		OystehrProjectID:       os.Getenv("OYSTEHR_PROJECT_ID"),
+		OystehrM2MClientID:     os.Getenv("OYSTEHR_M2M_CLIENT_ID"),
+		OystehrM2MClientSecret: os.Getenv("OYSTEHR_M2M_CLIENT_SECRET"),
+		AlertProviderFHIRID:    os.Getenv("ALERT_PROVIDER_FHIR_ID"),
+		Port:                   os.Getenv("PORT"),
+	}
+
+	// Validate required fields
+	if cfg.OystehrFHIRBaseURL == "" {
+		return nil, fmt.Errorf("required environment variable OYSTEHR_FHIR_BASE_URL is not set")
+	}
+	if cfg.OystehrAuthURL == "" {
+		return nil, fmt.Errorf("required environment variable OYSTEHR_AUTH_URL is not set")
+	}
+	if cfg.OystehrProjectID == "" {
+		return nil, fmt.Errorf("required environment variable OYSTEHR_PROJECT_ID is not set")
+	}
+	if cfg.OystehrM2MClientID == "" {
+		return nil, fmt.Errorf("required environment variable OYSTEHR_M2M_CLIENT_ID is not set")
+	}
+	if cfg.OystehrM2MClientSecret == "" {
+		return nil, fmt.Errorf("required environment variable OYSTEHR_M2M_CLIENT_SECRET is not set")
+	}
+	if cfg.AlertProviderFHIRID == "" {
+		return nil, fmt.Errorf("required environment variable ALERT_PROVIDER_FHIR_ID is not set")
+	}
+
+	// Set default port if not provided
+	if cfg.Port == "" {
+		cfg.Port = "8080"
+	}
+
+	return cfg, nil
+}
+
+
+===== FILE: ./internal/fhir/communication.go =====
+package fhir
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"example.com/epds-service/internal/config"
+)
+
+// fhirCommunication represents the structure needed to create the Communication resource.
+// Based on Appendix A.3 of pdr.md.
+type fhirCommunication struct {
+	ResourceType string          `json:"resourceType"`
+	Status       string          `json:"status"`
+	Category     []fhirCategory  `json:"category"`  // Reusing from observation.go
+	Subject      fhirReference   `json:"subject"`   // Reusing from observation.go
+	Recipient    []fhirReference `json:"recipient"` // Reusing fhirReference
+	Payload      []fhirPayload   `json:"payload"`
+	Sent         string          `json:"sent"`
+}
+
+type fhirPayload struct {
+	ContentString string `json:"contentString"`
+}
+
+// Note: fhirCategory, fhirCoding, fhirReference, and createdResource are assumed
+// to be defined in the same package (e.g., in observation.go or flag.go).
+
+// CreateCommunication sends a POST request to the Oystehr FHIR API to create a Communication resource.
+// It returns the ID of the created Communication or an error.
+func CreateCommunication(httpClient *http.Client, cfg *config.Config, token string, patientID string, providerID string, totalScore int, q10Score int) (string, error) {
+	// Use a default client if none is provided
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
+
+	// Construct the FHIR Communication payload
+	comm := fhirCommunication{
+		ResourceType: "Communication",
+		Status:       "completed",
+		Category: []fhirCategory{{
+			Coding: []fhirCoding{{
+				System:  "http://terminology.hl7.org/CodeSystem/communication-category",
+				Code:    "alert",
+				Display: "Alert",
+			}},
+		}},
+		Subject:   fhirReference{Reference: fmt.Sprintf("Patient/%s", patientID)},
+		Recipient: []fhirReference{{Reference: providerID}}, // Use providerID from config
+		Payload: []fhirPayload{{
+			ContentString: fmt.Sprintf("Alert: High EPDS score (%d) recorded for Patient %s. Q10 Score: %d. Please review patient chart.", totalScore, patientID, q10Score),
+		}},
+		Sent: time.Now().Format(time.RFC3339), // ISO8601 Format
+	}
+
+	commBytes, err := json.Marshal(comm)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal FHIR Communication JSON: %w", err)
+	}
+
+	// Construct the request URL
+	url := cfg.OystehrFHIRBaseURL + "/Communication"
+
+	// Create the HTTP request
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(commBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create FHIR Communication request: %w", err)
+	}
+
+	// Set required headers
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+	req.Header.Set("Content-Type", "application/fhir+json")
+	req.Header.Set("Accept", "application/fhir+json")
+
+	// Execute the request
+	log.Printf("Sending POST request to %s to create Communication for Patient %s", url, patientID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute FHIR Communication request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		log.Printf("Warning: failed to read response body after status %d for Communication creation: %v", resp.StatusCode, readErr)
+	}
+
+	// Check response status code
+	if resp.StatusCode != http.StatusCreated { // 201 Created
+		errBody := string(bodyBytes)
+		if errBody == "" && readErr != nil {
+			errBody = fmt.Sprintf("(could not read body: %v)", readErr)
+		}
+		log.Printf("ERROR: FHIR Communication creation failed. Status: %d, Body: %s", resp.StatusCode, errBody)
+		return "", fmt.Errorf("FHIR API error creating Communication (status %d): %s", resp.StatusCode, errBody)
+	}
+
+	// Parse the response body to get the created resource ID
+	var createdComm createdResource // Reusing the struct from observation.go
+	if err := json.Unmarshal(bodyBytes, &createdComm); err != nil {
+		log.Printf("ERROR: Failed to unmarshal FHIR Communication response body: %s. Error: %v", string(bodyBytes), err)
+		return "", fmt.Errorf("failed to parse FHIR Communication response body: %w", err)
+	}
+
+	if createdComm.ID == "" {
+		log.Printf("ERROR: FHIR Communication created (201) but response did not contain an ID. Body: %s", string(bodyBytes))
+		return "", fmt.Errorf("FHIR Communication created but response missing ID")
+	}
+
+	log.Printf("Successfully created FHIR Communication with ID: %s for Patient %s", createdComm.ID, patientID)
+	return createdComm.ID, nil
+}
+
+
+===== FILE: ./internal/fhir/flag.go =====
+package fhir
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"example.com/epds-service/internal/config"
+)
+
+// fhirFlag represents the structure needed to create the Flag resource.
+// Based on Appendix A.2 of pdr.md.
+type fhirFlag struct {
+	ResourceType string         `json:"resourceType"`
+	Status       string         `json:"status"`
+	Category     []fhirCategory `json:"category"`            // Reusing from observation.go (implicitly)
+	Code         fhirCode       `json:"code"`                // Reusing from observation.go (implicitly)
+	Subject      fhirReference  `json:"subject"`             // Reusing from observation.go (implicitly)
+	Encounter    *fhirReference `json:"encounter,omitempty"` // Add Encounter field
+	Meta         *fhirMeta      `json:"meta,omitempty"`      // Add Meta field
+}
+
+// fhirMeta defines the structure for the meta field, including tags.
+// Assuming fhirCoding is defined elsewhere in the package.
+type fhirMeta struct {
+	Tag []fhirCoding `json:"tag,omitempty"`
+}
+
+// Note: fhirCategory, fhirCoding, fhirCode, fhirReference, and createdResource are assumed
+// to be defined in the same package (e.g., in observation.go or a common types file).
+// If they are not accessible, they would need to be redefined or imported.
+
+// CreateFlag sends a POST request to the Oystehr FHIR API to create a Flag resource.
+// It returns the ID of the created Flag or an error.
+func CreateFlag(httpClient *http.Client, cfg *config.Config, token string, patientID string, encounterID string, totalScore int, q10Score int) (string, error) {
+	// Use a default client if none is provided
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
+
+	// Construct the FHIR Flag payload
+	flag := fhirFlag{
+		ResourceType: "Flag",
+		Status:       "active",
+		Category: []fhirCategory{{
+			Coding: []fhirCoding{{
+				System:  "http://example.org/codes", // Using example from PRD
+				Code:    "epds-high-risk",
+				Display: "EPDS High Risk Alert",
+			}},
+			Text: "High EPDS Score or Self-Harm Risk Reported", // Adding text as per example
+		}},
+		Code: fhirCode{
+			Coding: []fhirCoding{}, // Add empty coding slice
+			// No specific coding provided in PRD Appendix A.2, only text
+			Text: fmt.Sprintf("High EPDS Score (%d) or Q10 Risk (%d) indicated.", totalScore, q10Score),
+		},
+		Subject: fhirReference{Reference: fmt.Sprintf("Patient/%s", patientID)},
+	}
+
+	// Add Meta tag
+	flag.Meta = &fhirMeta{
+		Tag: []fhirCoding{{
+			System:  "urn:cornell:epds:tags",
+			Code:    "epds-high-risk",
+			Display: "EPDS High Risk Indicator",
+		}},
+	}
+
+	// Add Encounter if encounterID is provided
+	if encounterID != "" {
+		flag.Encounter = &fhirReference{Reference: fmt.Sprintf("Encounter/%s", encounterID)}
+	}
+
+	flagBytes, err := json.Marshal(flag)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal FHIR Flag JSON: %w", err)
+	}
+
+	// Construct the request URL
+	url := cfg.OystehrFHIRBaseURL + "/Flag"
+
+	// Create the HTTP request
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(flagBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create FHIR Flag request: %w", err)
+	}
+
+	// Set required headers
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+	req.Header.Set("Content-Type", "application/fhir+json")
+	req.Header.Set("Accept", "application/fhir+json")
+
+	// Execute the request
+	log.Printf("Sending POST request to %s to create Flag for Patient %s", url, patientID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute FHIR Flag request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		log.Printf("Warning: failed to read response body after status %d for Flag creation: %v", resp.StatusCode, readErr)
+	}
+
+	// Check response status code
+	if resp.StatusCode != http.StatusCreated { // 201 Created
+		errBody := string(bodyBytes)
+		if errBody == "" && readErr != nil {
+			errBody = fmt.Sprintf("(could not read body: %v)", readErr)
+		}
+		log.Printf("ERROR: FHIR Flag creation failed. Status: %d, Body: %s", resp.StatusCode, errBody)
+		return "", fmt.Errorf("FHIR API error creating Flag (status %d): %s", resp.StatusCode, errBody)
+	}
+
+	// Parse the response body to get the created resource ID
+	var createdFlag createdResource // Reusing the struct from observation.go
+	if err := json.Unmarshal(bodyBytes, &createdFlag); err != nil {
+		log.Printf("ERROR: Failed to unmarshal FHIR Flag response body: %s. Error: %v", string(bodyBytes), err)
+		return "", fmt.Errorf("failed to parse FHIR Flag response body: %w", err)
+	}
+
+	if createdFlag.ID == "" {
+		log.Printf("ERROR: FHIR Flag created (201) but response did not contain an ID. Body: %s", string(bodyBytes))
+		return "", fmt.Errorf("FHIR Flag created but response missing ID")
+	}
+
+	log.Printf("Successfully created FHIR Flag with ID: %s for Patient %s", createdFlag.ID, patientID)
+	return createdFlag.ID, nil
+}
+
+
+===== FILE: ./internal/fhir/observation.go =====
+package fhir
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"example.com/epds-service/internal/config"
+)
+
+// fhirObservation represents the structure needed to create the Observation resource.
+// Based on Appendix A.1 of pdr.md.
+type fhirObservation struct {
+	ResourceType      string         `json:"resourceType"`
+	Status            string         `json:"status"`
+	Category          []fhirCategory `json:"category"`
+	Code              fhirCode       `json:"code"`
+	Subject           fhirReference  `json:"subject"`
+	EffectiveDateTime string         `json:"effectiveDateTime"`
+	ValueInteger      int            `json:"valueInteger"`
+}
+
+type fhirCategory struct {
+	Coding []fhirCoding `json:"coding"`
+	Text   string       `json:"text,omitempty"`
+}
+
+type fhirCoding struct {
+	System  string `json:"system"`
+	Code    string `json:"code"`
+	Display string `json:"display"`
+}
+
+type fhirCode struct {
+	Coding []fhirCoding `json:"coding"`
+	Text   string       `json:"text"`
+}
+
+type fhirReference struct {
+	Reference string `json:"reference"`
+}
+
+// createdResource is used to unmarshal the response from FHIR server
+// to extract the ID of the newly created resource.
+type createdResource struct {
+	ID string `json:"id"`
+}
+
+// CreateObservation sends a POST request to the Oystehr FHIR API to create an Observation resource.
+// It returns the ID of the created Observation or an error.
+func CreateObservation(httpClient *http.Client, cfg *config.Config, token string, patientID string, totalScore int) (string, error) {
+	// Use a default client if none is provided
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
+
+	// Construct the FHIR Observation payload
+	obs := fhirObservation{
+		ResourceType: "Observation",
+		Status:       "final",
+		Category: []fhirCategory{{
+			Coding: []fhirCoding{{
+				System:  "http://terminology.hl7.org/CodeSystem/observation-category",
+				Code:    "survey",
+				Display: "Survey",
+			}},
+		}},
+		Code: fhirCode{
+			Coding: []fhirCoding{{
+				System:  "http://loinc.org",
+				Code:    "99046-5",
+				Display: "Total score [EPDS]",
+			}},
+			Text: "EPDS Total Score",
+		},
+		Subject:           fhirReference{Reference: fmt.Sprintf("Patient/%s", patientID)},
+		EffectiveDateTime: time.Now().Format(time.RFC3339), // ISO8601 Format
+		ValueInteger:      totalScore,
+	}
+
+	obsBytes, err := json.Marshal(obs)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal FHIR Observation JSON: %w", err)
+	}
+
+	// Construct the request URL
+	url := cfg.OystehrFHIRBaseURL + "/Observation" // Assuming base URL does not end with /
+	// TODO: Consider adding a check/fix for trailing slash in base URL
+
+	// Create the HTTP request
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(obsBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create FHIR Observation request: %w", err)
+	}
+
+	// Set required headers (as per Section 6.2)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("x-zapehr-project-id", cfg.OystehrProjectID)
+	req.Header.Set("Content-Type", "application/fhir+json")
+	req.Header.Set("Accept", "application/fhir+json")
+
+	// Execute the request
+	log.Printf("Sending POST request to %s to create Observation for Patient %s", url, patientID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute FHIR Observation request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		log.Printf("Warning: failed to read response body after status %d: %v", resp.StatusCode, readErr)
+		// Continue processing status code, but body might be unavailable for error reporting
+	}
+
+	// Check response status code
+	if resp.StatusCode != http.StatusCreated { // 201 Created
+		errBody := string(bodyBytes)
+		if errBody == "" && readErr != nil {
+			errBody = fmt.Sprintf("(could not read body: %v)", readErr)
+		}
+		log.Printf("ERROR: FHIR Observation creation failed. Status: %d, Body: %s", resp.StatusCode, errBody)
+		return "", fmt.Errorf("FHIR API error creating Observation (status %d): %s", resp.StatusCode, errBody)
+	}
+
+	// Parse the response body to get the created resource ID
+	var createdObs createdResource
+	if err := json.Unmarshal(bodyBytes, &createdObs); err != nil {
+		// Log the body if unmarshalling fails, it might not be the expected format
+		log.Printf("ERROR: Failed to unmarshal FHIR Observation response body: %s. Error: %v", string(bodyBytes), err)
+		return "", fmt.Errorf("failed to parse FHIR Observation response body: %w", err)
+	}
+
+	if createdObs.ID == "" {
+		log.Printf("ERROR: FHIR Observation created (201) but response did not contain an ID. Body: %s", string(bodyBytes))
+		return "", fmt.Errorf("FHIR Observation created but response missing ID")
+	}
+
+	log.Printf("Successfully created FHIR Observation with ID: %s for Patient %s", createdObs.ID, patientID)
+	return createdObs.ID, nil
+}
+
+
