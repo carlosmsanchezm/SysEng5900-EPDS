@@ -9,7 +9,7 @@ export OYSTEHR_M2M_CLIENT_ID="QfHq018YKWQDhWlbL9mW9jsT7JakDP5n"
 
 # --- IMPORTANT: Paste your NEW Secret Here ---
 # Replace YOUR_NEW_M2M_CLIENT_SECRET below with the actual secret you copied
-export OYSTEHR_M2M_CLIENT_SECRET="ufqGWeG1DKreVaYs7yydt2DJhnL3sHKgGauvTIcbiWZfQukDNKBvS_Wz8jzD2GMW"
+export OYSTEHR_M2M_CLIENT_SECRET="....."
 
 # --- Target Provider for Alerts ---
 # Using "Example Doctor" ID you provided
